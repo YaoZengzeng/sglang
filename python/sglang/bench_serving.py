@@ -1146,10 +1146,10 @@ def sample_generated_shared_prefix_requests(
     cache_path = get_gen_prefix_cache_path(args, tokenizer)
 
     # Try to load from cache first
-    if cache_path.exists():
-        print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
+    #if cache_path.exists():
+    #    print(f"\nLoading cached generated input data from {cache_path}")
+    #    with open(cache_path, "rb") as f:
+    #        return pickle.load(f)
 
     print("\nGenerating new input data...")
 
@@ -1793,6 +1793,7 @@ class LoRAPathAction(argparse.Action):
 
 
 if __name__ == "__main__":
+    print("start benchmark")
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
