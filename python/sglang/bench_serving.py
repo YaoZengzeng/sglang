@@ -1213,10 +1213,59 @@ def sample_generated_shared_prefix_requests(
     return input_requests
 
 
+def _reorder_requests_by_group(
+    input_requests: List[DatasetRow],
+) -> List[DatasetRow]:
+    """Reorder requests based on group sending strategy.
+
+    Controlled by environment variables:
+      - SGLANG_BENCH_GROUP_SIZE: Number of requests per group. Default 0 means
+        no grouping (all requests treated as one group).
+      - SGLANG_BENCH_GROUP_MODE: "sequential" or "interleaved".
+        * "sequential" (default): send all requests from group 0, then group 1, etc.
+        * "interleaved": round-robin across groups (one from group 0, one from
+          group 1, ..., then back to group 0, etc.).
+    """
+    group_size = int(os.getenv("SGLANG_BENCH_GROUP_SIZE", "0"))
+    group_mode = os.getenv("SGLANG_BENCH_GROUP_MODE", "sequential").lower()
+
+    if group_size <= 0 or group_size >= len(input_requests):
+        # No grouping needed
+        return input_requests
+
+    # Split requests into groups
+    groups = [
+        input_requests[i : i + group_size]
+        for i in range(0, len(input_requests), group_size)
+    ]
+    num_groups = len(groups)
+
+    print(
+        f"Group sending enabled: {num_groups} groups, "
+        f"{group_size} requests/group, mode={group_mode}"
+    )
+
+    if group_mode == "interleaved":
+        # Round-robin across groups
+        reordered = []
+        max_group_len = max(len(g) for g in groups)
+        for idx in range(max_group_len):
+            for group in groups:
+                if idx < len(group):
+                    reordered.append(group[idx])
+        return reordered
+    else:
+        # "sequential" - keep original order (group 0, then group 1, ...)
+        return input_requests
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
 ) -> AsyncGenerator[DatasetRow, None]:
+    # Apply group reordering before generating requests
+    input_requests = _reorder_requests_by_group(input_requests)
+
     input_requests = iter(input_requests)
     for request in input_requests:
         yield request
