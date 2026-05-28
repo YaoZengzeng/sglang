@@ -1215,23 +1215,44 @@ def sample_generated_shared_prefix_requests(
 
 def _reorder_requests_by_group(
     input_requests: List[DatasetRow],
-) -> List[DatasetRow]:
+) -> Tuple[List[DatasetRow], List[int], int]:
     """Reorder requests based on group sending strategy.
+
+    Group size is determined by (in priority order):
+      1. SGLANG_BENCH_GROUP_SIZE environment variable
+      2. For 'generated-shared-prefix' dataset: args.gsp_prompts_per_group
 
     Controlled by environment variables:
       - SGLANG_BENCH_GROUP_SIZE: Number of requests per group. Default 0 means
-        no grouping (all requests treated as one group).
+        auto-detect from dataset or no grouping.
       - SGLANG_BENCH_GROUP_MODE: "sequential" or "interleaved".
         * "sequential" (default): send all requests from group 0, then group 1, etc.
         * "interleaved": round-robin across groups (one from group 0, one from
           group 1, ..., then back to group 0, etc.).
+
+    Returns:
+        Tuple of (reordered_requests, group_indices, group_size) where group_indices[i]
+        is the group index for the i-th request in the reordered list.
+        group_size is 0 if grouping is disabled.
     """
-    group_size = int(os.getenv("SGLANG_BENCH_GROUP_SIZE", "0"))
+    group_size_env = os.getenv("SGLANG_BENCH_GROUP_SIZE", "")
     group_mode = os.getenv("SGLANG_BENCH_GROUP_MODE", "sequential").lower()
+
+    # Determine group size
+    if group_size_env:
+        group_size = int(group_size_env)
+    elif (
+        hasattr(args, "dataset_name")
+        and args.dataset_name == "generated-shared-prefix"
+    ):
+        # Auto-detect from generated-shared-prefix dataset parameters
+        group_size = getattr(args, "gsp_prompts_per_group", 0)
+    else:
+        group_size = 0
 
     if group_size <= 0 or group_size >= len(input_requests):
         # No grouping needed
-        return input_requests
+        return input_requests, [], 0
 
     # Split requests into groups
     groups = [
@@ -1248,24 +1269,122 @@ def _reorder_requests_by_group(
     if group_mode == "interleaved":
         # Round-robin across groups
         reordered = []
+        group_indices = []
         max_group_len = max(len(g) for g in groups)
         for idx in range(max_group_len):
-            for group in groups:
+            for gid, group in enumerate(groups):
                 if idx < len(group):
                     reordered.append(group[idx])
-        return reordered
+                    group_indices.append(gid)
+        return reordered, group_indices, group_size
     else:
         # "sequential" - keep original order (group 0, then group 1, ...)
-        return input_requests
+        group_indices = []
+        for gid, group in enumerate(groups):
+            group_indices.extend([gid] * len(group))
+        return input_requests, group_indices, group_size
+
+
+class GroupProgressTracker:
+    """Tracks and displays per-group progress during benchmarking."""
+
+    def __init__(self, group_indices: List[int], group_size: int):
+        self.enabled = len(group_indices) > 0
+        if not self.enabled:
+            return
+        self.group_indices = group_indices
+        self.group_size = group_size
+        self.num_groups = max(group_indices) + 1
+        # Track: sent, completed, succeeded, failed per group
+        self.sent = [0] * self.num_groups
+        self.completed = [0] * self.num_groups
+        self.succeeded = [0] * self.num_groups
+        self.failed = [0] * self.num_groups
+        self.group_totals = [0] * self.num_groups
+        for gid in group_indices:
+            self.group_totals[gid] += 1
+        self._last_print_time = 0.0
+        self._start_time = time.perf_counter()
+
+    def start(self):
+        """Print initial progress information when benchmark starts."""
+        if not self.enabled:
+            return
+        total_requests = sum(self.group_totals)
+        print(f"\n[Group Progress] Tracking {self.num_groups} groups, "
+              f"{total_requests} total requests "
+              f"({self.group_size} per group)")
+        sys.stdout.flush()
+
+    def mark_sent(self, request_idx: int):
+        if not self.enabled:
+            return
+        gid = self.group_indices[request_idx]
+        self.sent[gid] += 1
+
+    def mark_completed(self, request_idx: int, success: bool):
+        if not self.enabled:
+            return
+        gid = self.group_indices[request_idx]
+        self.completed[gid] += 1
+        if success:
+            self.succeeded[gid] += 1
+        else:
+            self.failed[gid] += 1
+        self._maybe_print_progress()
+
+    def _maybe_print_progress(self):
+        """Print progress at most every 5 seconds."""
+        now = time.perf_counter()
+        if now - self._last_print_time < 5.0:
+            return
+        self._last_print_time = now
+        self._print_progress()
+
+    def _print_progress(self):
+        elapsed = time.perf_counter() - self._start_time
+        total_completed = sum(self.completed)
+        total_requests = sum(self.group_totals)
+        lines = [
+            f"\n[{elapsed:.1f}s] Overall: {total_completed}/{total_requests} completed"
+        ]
+        # Show summary for each group
+        for gid in range(self.num_groups):
+            status = "DONE" if self.completed[gid] == self.group_totals[gid] else "..."
+            fail_str = f", {self.failed[gid]} failed" if self.failed[gid] > 0 else ""
+            lines.append(
+                f"  Group {gid:>2}: "
+                f"{self.completed[gid]:>4}/{self.group_totals[gid]} completed"
+                f" ({self.succeeded[gid]} ok{fail_str}) [{status}]"
+            )
+        print("\n".join(lines))
+        sys.stdout.flush()
+
+    def print_final_summary(self):
+        if not self.enabled:
+            return
+        elapsed = time.perf_counter() - self._start_time
+        print(f"\n{'=' * 50}")
+        print(f" Group Progress Final Summary (elapsed: {elapsed:.1f}s)")
+        print(f"{'=' * 50}")
+        total_completed = sum(self.completed)
+        total_requests = sum(self.group_totals)
+        print(f" Total: {total_completed}/{total_requests} requests completed")
+        for gid in range(self.num_groups):
+            fail_str = f", {self.failed[gid]} failed" if self.failed[gid] > 0 else ""
+            print(
+                f"  Group {gid:>2}: "
+                f"{self.completed[gid]:>4}/{self.group_totals[gid]} completed"
+                f" ({self.succeeded[gid]} ok{fail_str})"
+            )
+        print(f"{'=' * 50}\n")
+        sys.stdout.flush()
 
 
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
 ) -> AsyncGenerator[DatasetRow, None]:
-    # Apply group reordering before generating requests
-    input_requests = _reorder_requests_by_group(input_requests)
-
     input_requests = iter(input_requests)
     for request in input_requests:
         yield request
@@ -1449,11 +1568,28 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
+    # Apply group reordering
+    input_requests, group_indices, group_size = _reorder_requests_by_group(
+        input_requests
+    )
+    group_tracker = GroupProgressTracker(group_indices, group_size)
+    group_tracker.start()
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+
+    async def _tracked_request(request_func_input, pbar, request_idx, tracker):
+        """Wrapper that tracks per-group completion."""
+        result = await limited_request_func(
+            request_func_input=request_func_input, pbar=pbar
+        )
+        tracker.mark_completed(request_idx, result.success)
+        return result
+
+    request_idx = 0
     async for request in get_request(input_requests, request_rate):
         if lora_names is not None and len(lora_names) != 0:
             idx = random.randint(0, len(lora_names) - 1)
@@ -1472,12 +1608,21 @@ async def benchmark(
             extra_request_body=extra_request_body,
         )
 
+        group_tracker.mark_sent(request_idx)
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                _tracked_request(
+                    request_func_input=request_func_input,
+                    pbar=pbar,
+                    request_idx=request_idx,
+                    tracker=group_tracker,
+                )
             )
         )
+        request_idx += 1
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    group_tracker.print_final_summary()
 
     # Stop profiler
     if profile:
