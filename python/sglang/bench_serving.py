@@ -1608,6 +1608,9 @@ async def benchmark(
             extra_request_body=extra_request_body,
         )
 
+        prompt_preview = request.prompt[:100] if isinstance(request.prompt, str) else str(request.prompt[:20])
+        print(f"[Req {request_idx}] prompt[:100]: {prompt_preview}")
+
         group_tracker.mark_sent(request_idx)
         tasks.append(
             asyncio.create_task(
