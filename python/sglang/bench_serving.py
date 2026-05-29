@@ -17,6 +17,7 @@ import os
 import pickle
 import random
 import resource
+import shutil
 import sys
 import time
 import traceback
@@ -1283,10 +1284,17 @@ def _reorder_requests_by_group(
 
 
 class GroupProgressTracker:
-    """Tracks and displays per-group progress during benchmarking."""
+    """Tracks and displays per-group progress during benchmarking.
+
+    When stdout is attached to an interactive terminal, this renders a compact
+    in-place TUI so all groups can be viewed on a single screen. For very large
+    group counts that do not fit as labeled cells, it falls back to a heatmap
+    where each character represents one or more groups.
+    """
 
     def __init__(self, group_indices: List[int], group_size: int):
         self.enabled = len(group_indices) > 0
+        self.uses_tui = False
         if not self.enabled:
             return
         self.group_indices = group_indices
@@ -1302,15 +1310,30 @@ class GroupProgressTracker:
             self.group_totals[gid] += 1
         self._last_print_time = 0.0
         self._start_time = time.perf_counter()
+        self._rendered_lines = 0
+        self._last_render_time = 0.0
+        self._render_interval_s = float(os.getenv("SGLANG_BENCH_TUI_INTERVAL", "0.5"))
+        self.uses_tui = (
+            sys.stdout.isatty()
+            and os.getenv("TERM", "") != "dumb"
+            and not _get_bool_env_var("SGLANG_BENCH_DISABLE_TUI")
+        )
 
     def start(self):
         """Print initial progress information when benchmark starts."""
         if not self.enabled:
             return
-        total_requests = sum(self.group_totals)
-        print(f"\n[Group Progress] Tracking {self.num_groups} groups, "
-              f"{total_requests} total requests "
-              f"({self.group_size} per group)")
+        if self.uses_tui:
+            # Hide the cursor while the in-place dashboard is active.
+            sys.stdout.write("\x1b[?25l")
+            self._render(force=True)
+        else:
+            total_requests = sum(self.group_totals)
+            print(
+                f"\n[Group Progress] Tracking {self.num_groups} groups, "
+                f"{total_requests} total requests "
+                f"({self.group_size} per group)"
+            )
         sys.stdout.flush()
 
     def mark_sent(self, request_idx: int):
@@ -1318,6 +1341,7 @@ class GroupProgressTracker:
             return
         gid = self.group_indices[request_idx]
         self.sent[gid] += 1
+        self._maybe_render()
 
     def mark_completed(self, request_idx: int, success: bool):
         if not self.enabled:
@@ -1328,15 +1352,168 @@ class GroupProgressTracker:
             self.succeeded[gid] += 1
         else:
             self.failed[gid] += 1
-        self._maybe_print_progress()
+        self._maybe_render()
 
-    def _maybe_print_progress(self):
-        """Print progress at most every 5 seconds."""
+    def _maybe_render(self):
+        """Render progress periodically."""
         now = time.perf_counter()
+        if self.uses_tui:
+            if now - self._last_render_time < self._render_interval_s:
+                return
+            self._render()
+            return
         if now - self._last_print_time < 5.0:
             return
         self._last_print_time = now
         self._print_progress()
+
+    def _progress_bar(self, gid: int, width: int) -> str:
+        width = max(width, 1)
+        total = max(self.group_totals[gid], 1)
+        filled = int(width * self.completed[gid] / total)
+        if self.completed[gid] == total:
+            filled = width
+        return "█" * filled + "░" * (width - filled)
+
+    def _heatmap_char(self, start_gid: int, end_gid: int) -> str:
+        failed = sum(self.failed[start_gid:end_gid])
+        if failed:
+            return "!"
+        completed = sum(self.completed[start_gid:end_gid])
+        sent = sum(self.sent[start_gid:end_gid])
+        total = max(sum(self.group_totals[start_gid:end_gid]), 1)
+        ratio = completed / total
+        if ratio >= 1.0:
+            return "█"
+        if ratio >= 0.75:
+            return "▓"
+        if ratio >= 0.5:
+            return "▒"
+        if ratio > 0:
+            return "░"
+        if sent > 0:
+            return "·"
+        return " "
+
+    def _build_detailed_grid(
+        self, width: int, available_rows: int, digits: int, count_width: int
+    ) -> Optional[List[str]]:
+        min_cell_width = digits + count_width * 2 + 12
+        max_cols = max(width // min_cell_width, 1)
+        selected_cols = 0
+        for cols in range(max_cols, 0, -1):
+            rows = (self.num_groups + cols - 1) // cols
+            if rows <= available_rows and width // cols >= min_cell_width:
+                selected_cols = cols
+                break
+        if selected_cols == 0:
+            return None
+
+        cell_width = max(width // selected_cols, min_cell_width)
+        bar_width = max(cell_width - digits - count_width * 2 - 11, 1)
+        rows = []
+        for row_start in range(0, self.num_groups, selected_cols):
+            cells = []
+            for gid in range(row_start, min(row_start + selected_cols, self.num_groups)):
+                total = self.group_totals[gid]
+                pct = int(100 * self.completed[gid] / max(total, 1))
+                status = (
+                    "!"
+                    if self.failed[gid]
+                    else "✓"
+                    if self.completed[gid] == total
+                    else " "
+                )
+                cell = (
+                    f"G{gid:0{digits}d} [{self._progress_bar(gid, bar_width)}] "
+                    f"{self.completed[gid]:>{count_width}}/{total:<{count_width}} "
+                    f"{pct:3d}%{status}"
+                )
+                cells.append(cell[: cell_width - 1].ljust(cell_width - 1))
+            rows.append("".join(cells).rstrip())
+        return rows
+
+    def _build_heatmap(
+        self, width: int, available_rows: int, digits: int
+    ) -> List[str]:
+        prefix_width = digits * 2 + 4
+        cells_per_row = max(width - prefix_width, 1)
+        total_slots = max(cells_per_row * available_rows, 1)
+        groups_per_cell = max((self.num_groups + total_slots - 1) // total_slots, 1)
+        groups_per_row = groups_per_cell * cells_per_row
+        rows = []
+        for row_start in range(0, self.num_groups, groups_per_row):
+            row_end = min(row_start + groups_per_row, self.num_groups)
+            chars = []
+            for cell_start in range(row_start, row_end, groups_per_cell):
+                cell_end = min(cell_start + groups_per_cell, self.num_groups)
+                chars.append(self._heatmap_char(cell_start, cell_end))
+            rows.append(
+                f"{row_start:0{digits}d}-{row_end - 1:0{digits}d} "
+                + "".join(chars)
+            )
+        return rows[:available_rows]
+
+    def _build_tui_lines(self) -> List[str]:
+        terminal_size = shutil.get_terminal_size(fallback=(120, 40))
+        width = max(terminal_size.columns, 20)
+        height = max(terminal_size.lines, 12)
+        digits = max(len(str(self.num_groups - 1)), 2)
+        count_width = max(len(str(max(self.group_totals))), 1)
+
+        elapsed = time.perf_counter() - self._start_time
+        total_requests = sum(self.group_totals)
+        total_sent = sum(self.sent)
+        total_completed = sum(self.completed)
+        total_succeeded = sum(self.succeeded)
+        total_failed = sum(self.failed)
+        throughput = total_completed / elapsed if elapsed > 0 else 0.0
+        overall_bar_width = min(max(width - 42, 10), 50)
+        overall_filled = int(
+            overall_bar_width * total_completed / max(total_requests, 1)
+        )
+        if total_completed == total_requests:
+            overall_filled = overall_bar_width
+        overall_bar = "█" * overall_filled + "░" * (overall_bar_width - overall_filled)
+
+        lines = [
+            "─" * min(width, 120),
+            "Group Progress Dashboard".center(min(width, 120)),
+            (
+                f"elapsed {elapsed:7.1f}s | sent {total_sent}/{total_requests} | "
+                f"done {total_completed}/{total_requests} | ok {total_succeeded} | "
+                f"failed {total_failed} | {throughput:.2f} req/s"
+            ),
+            f"overall [{overall_bar}]",
+        ]
+
+        available_rows = max(height - len(lines) - 3, 1)
+        grid = self._build_detailed_grid(width, available_rows, digits, count_width)
+        if grid is None:
+            lines.append(
+                "heatmap: █ done  ▓ >=75%  ▒ >=50%  ░ started  · sent  ! failed"
+            )
+            available_rows = max(height - len(lines) - 2, 1)
+            grid = self._build_heatmap(width, available_rows, digits)
+        lines.extend(grid)
+        lines.append("─" * min(width, 120))
+        return [line[:width] for line in lines[:height]]
+
+    def _render(self, force: bool = False):
+        now = time.perf_counter()
+        if not force and now - self._last_render_time < self._render_interval_s:
+            return
+        self._last_render_time = now
+        lines = self._build_tui_lines()
+        target_lines = max(self._rendered_lines, len(lines))
+        if self._rendered_lines:
+            sys.stdout.write(f"\x1b[{self._rendered_lines}F")
+        for line in lines:
+            sys.stdout.write(f"\x1b[2K{line}\n")
+        for _ in range(target_lines - len(lines)):
+            sys.stdout.write("\x1b[2K\n")
+        self._rendered_lines = target_lines
+        sys.stdout.flush()
 
     def _print_progress(self):
         elapsed = time.perf_counter() - self._start_time
@@ -1359,6 +1536,22 @@ class GroupProgressTracker:
 
     def print_final_summary(self):
         if not self.enabled:
+            return
+        if self.uses_tui:
+            self._render(force=True)
+            sys.stdout.write("\x1b[?25h\n")
+            elapsed = time.perf_counter() - self._start_time
+            failed_groups = [
+                gid for gid in range(self.num_groups) if self.failed[gid] > 0
+            ]
+            print(
+                f"Group progress completed in {elapsed:.1f}s: "
+                f"{sum(self.completed)}/{sum(self.group_totals)} requests completed, "
+                f"{sum(self.succeeded)} succeeded, {sum(self.failed)} failed."
+            )
+            if failed_groups:
+                print(f"Failed groups: {failed_groups}")
+            sys.stdout.flush()
             return
         elapsed = time.perf_counter() - self._start_time
         print(f"\n{'=' * 50}")
@@ -1572,7 +1765,11 @@ async def benchmark(
     group_tracker = GroupProgressTracker(group_indices, group_size)
     group_tracker.start()
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = (
+        None
+        if disable_tqdm or group_tracker.enabled
+        else tqdm(total=len(input_requests))
+    )
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -1605,8 +1802,13 @@ async def benchmark(
             extra_request_body=extra_request_body,
         )
 
-        prompt_preview = request.prompt[:100] if isinstance(request.prompt, str) else str(request.prompt[:20])
-        print(f"[Req {request_idx}] prompt[:100]: {prompt_preview}")
+        if _get_bool_env_var("SGLANG_BENCH_PRINT_PROMPTS"):
+            prompt_preview = (
+                request.prompt[:100]
+                if isinstance(request.prompt, str)
+                else str(request.prompt[:20])
+            )
+            print(f"[Req {request_idx}] prompt[:100]: {prompt_preview}")
 
         group_tracker.mark_sent(request_idx)
         tasks.append(
