@@ -1187,9 +1187,6 @@ def sample_generated_shared_prefix_requests(
             total_input_tokens += prompt_len
             total_output_tokens += output_len
 
-    # Shuffle questions
-    random.shuffle(input_requests)
-
     # Print statistics
     print(f"\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
