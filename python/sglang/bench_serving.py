@@ -1223,10 +1223,11 @@ def _reorder_requests_by_group(
     Controlled by environment variables:
       - SGLANG_BENCH_GROUP_SIZE: Number of requests per group. Default 0 means
         auto-detect from dataset or no grouping.
-      - SGLANG_BENCH_GROUP_MODE: "sequential" or "interleaved".
+      - SGLANG_BENCH_GROUP_MODE: "sequential", "interleaved", or "random".
         * "sequential" (default): send all requests from group 0, then group 1, etc.
         * "interleaved": round-robin across groups (one from group 0, one from
           group 1, ..., then back to group 0, etc.).
+        * "random": shuffle all requests randomly across all groups.
 
     Returns:
         Tuple of (reordered_requests, group_indices, group_size) where group_indices[i]
@@ -1274,6 +1275,16 @@ def _reorder_requests_by_group(
                 if idx < len(group):
                     reordered.append(group[idx])
                     group_indices.append(gid)
+        return reordered, group_indices, group_size
+    elif group_mode == "random":
+        # Shuffle all requests randomly
+        group_indices = []
+        for gid, group in enumerate(groups):
+            group_indices.extend([gid] * len(group))
+        combined = list(zip(input_requests, group_indices))
+        random.shuffle(combined)
+        reordered = [item for item, _ in combined]
+        group_indices = [gid for _, gid in combined]
         return reordered, group_indices, group_size
     else:
         # "sequential" - keep original order (group 0, then group 1, ...)
